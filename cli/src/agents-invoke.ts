@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { resolveOnPath, AGENTS, type AgentDef, type AgentProtocol } from "./agents-detect.js";
 
 export type InvokeOpts = {
@@ -183,6 +184,18 @@ function envFor(agent: string): NodeJS.ProcessEnv {
   const base = { ...process.env };
   if (agent === "gemini") base.GEMINI_CLI_TRUST_WORKSPACE = "true";
   return base;
+}
+
+export function createMessageFile(prompt: string): {filePath: string; cleanup: () => void;} {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "html-anything-agent-message-"));
+  const filePath = path.join(dir, "message.txt");
+  writeFileSync(filePath, prompt, { encoding: "utf8", mode: 0o600 });
+  const cleanup = () => {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  };
+  return { filePath, cleanup };
 }
 
 // ─── stdout parser ────────────────────────────────────────────────────
@@ -458,11 +471,13 @@ export function invokeAgent(opts: InvokeOpts): ReadableStream<InvokeEvent> {
   const env = envFor(opts.agent);
   const promptViaArgv = def.protocol === "argv";
   const promptViaMessageFlag = def.protocol === "argv-message";
+  const promptViaFileFlag = def.protocol === "file";
 
   return new ReadableStream<InvokeEvent>({
     async start(controller) {
       let closed = false;
       let child: ChildProcessWithoutNullStreams | null = null;
+      let messageFile: { filePath: string; cleanup: () => void } | undefined;
 
       const safeEnqueue = (ev: InvokeEvent) => {
         if (closed) return;
@@ -478,6 +493,12 @@ export function invokeAgent(opts: InvokeOpts): ReadableStream<InvokeEvent> {
         try {
           controller.close();
         } catch {}
+      };
+      const cleanupMessageFile = () => {
+        if (messageFile) {
+          messageFile.cleanup();
+          messageFile = undefined;
+        }
       };
 
       let argv: string[];
@@ -504,7 +525,10 @@ export function invokeAgent(opts: InvokeOpts): ReadableStream<InvokeEvent> {
       }
       if (promptViaArgv) argv = [...argv, opts.prompt];
       if (promptViaMessageFlag) argv = [...argv, "--message", opts.prompt];
-
+      if (promptViaFileFlag) {
+        messageFile = createMessageFile(opts.prompt);
+        argv = [...argv, "--message-file", messageFile.filePath];
+      }
       try {
         child = spawn(bin, argv, {
           cwd: opts.cwd ?? process.cwd(),
@@ -517,6 +541,7 @@ export function invokeAgent(opts: InvokeOpts): ReadableStream<InvokeEvent> {
           type: "error",
           message: err instanceof Error ? err.message : String(err),
         });
+        cleanupMessageFile();
         safeClose();
         return;
       }
@@ -563,6 +588,7 @@ export function invokeAgent(opts: InvokeOpts): ReadableStream<InvokeEvent> {
 
       child.on("error", (err) => {
         safeEnqueue({ type: "error", message: err.message });
+        cleanupMessageFile();
         safeClose();
       });
 
@@ -604,6 +630,7 @@ export function invokeAgent(opts: InvokeOpts): ReadableStream<InvokeEvent> {
           }
         }
         safeEnqueue({ type: "done", code });
+        cleanupMessageFile();
         safeClose();
       });
 
@@ -611,6 +638,7 @@ export function invokeAgent(opts: InvokeOpts): ReadableStream<InvokeEvent> {
         try {
           child?.kill("SIGTERM");
         } catch {}
+        cleanupMessageFile();
         safeClose();
       };
       opts.signal?.addEventListener("abort", onAbort, { once: true });
